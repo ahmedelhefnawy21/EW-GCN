@@ -1,5 +1,6 @@
 # EW-GCN
 Entity-Word Graph Convolutional Network (EW-GCN)
+
 I implement an Entity-Word Graph Convolutional Network (EW-GCN) for text classification using the 20-Newsgroups dataset. It builds graphs from documents, where nodes are entities and content words, and uses graph convolutional layers to classify texts based on entity-focused features.
 ## Requirements
 
