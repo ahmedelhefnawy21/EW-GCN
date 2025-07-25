@@ -1,237 +1,303 @@
-import spacy
+from __future__ import annotations
+import csv, itertools, random, time, typing
+from pathlib import Path
+
+import numpy as np
 import torch
 import torch.nn.functional as F
+from torch import Tensor
 from torch_geometric.data import Data
-from torch_geometric.nn import GCNConv, global_mean_pool
-from sklearn.datasets import fetch_20newsgroups
 from torch_geometric.loader import DataLoader
+from torch_geometric.nn import GCNConv, global_add_pool, global_mean_pool
+
+from sklearn.datasets import fetch_20newsgroups
 from sklearn.model_selection import train_test_split
-
-
-# Load the spaCy model with medium-sized English vectors
-nlp = spacy.load("en_core_web_md")
-
-def extract_nodes(text):
-    """
-    Extracts unique entities and content words from a text.
-
-    Args:
-        text (str): Input text to process.
-
-    Returns:
-        tuple: (nodes, entities, words)
-            - nodes: List of unique entities followed by unique words.
-            - entities: List of unique named entities.
-            - words: List of alphabetic, non-stop words not part of entities.
-    """
-    doc = nlp(text)
-    # 1) Collect unique entities from the text
-    entities = [ent.text for ent in doc.ents]
-    # 2) Identify spans of entities to exclude their tokens from word list
-    ent_spans = {(ent.start, ent.end) for ent in doc.ents}
-    words = []
-    for token in doc:
-        # Include only alphabetic, non-stop words not within entity spans
-        if token.is_alpha and not token.is_stop:
-            # Check if token is outside all entity spans
-            if not any(start <= token.i < end for start, end in ent_spans):
-                words.append(token.text.lower())
-    # Combine entities and words, removing duplicates while preserving order
-    nodes = list(dict.fromkeys(entities + words))
-    return nodes, entities, words
-
-
-# Get the vector length of spaCy embeddings (typically 300 for 'en_core_web_md')
-vec_len = nlp.vocab.vectors_length  # 300 (or 50 if using a smaller model)
-
-def get_embedding(token):
-    """
-    Retrieves the embedding vector for a given token.
-
-    Args:
-        token (str): The token to embed.
-
-    Returns:
-        Tensor: Embedding vector as a PyTorch tensor.
-    """
-    return torch.tensor(nlp(token).vector, dtype=torch.float)
-
-def build_graph(text, label, max_words=80, window=2):
-    """
-    Constructs a graph from text with entities and words as nodes.
-
-    Args:
-        text (str): Input text.
-        label (int): Class label for the text.
-        max_words (int): Maximum number of words to include.
-        window (int): Window size for word-word edges.
-
-    Returns:
-        Data or None: PyTorch Geometric Data object or None if invalid.
-    """
-    nodes, entities, words = extract_nodes(text)
-    if len(entities) == 0:  # Skip documents with no entities
-        return None
-    words = words[:max_words]  # Limit the number of words
-    if not nodes:  # Skip if no nodes are extracted
-        return None
-
-    # Create node features using half-precision embeddings
-    x = torch.stack([torch.tensor(nlp(tok).vector, dtype=torch.float16) for tok in nodes])
-    edge = []
-
-    # Add bidirectional edges between entities and words
-    for e in entities:
-        ei = nodes.index(e)
-        for w in words:
-            wi = nodes.index(w)
-            edge += [(ei, wi), (wi, ei)]
-
-    # Add edges between words within a sliding window
-    for i in range(len(words) - window + 1):
-        span = words[i:i + window]
-        for u in span:
-            for v in span:
-                if u != v:
-                    edge.append((nodes.index(u), nodes.index(v)))
-
-    # Convert edges to PyTorch Geometric format
-    edge_index = torch.tensor(edge, dtype=torch.long).t().contiguous()
-    data = Data(x=x, edge_index=edge_index, y=torch.tensor([label]), num_entity=len(entities))
-    return data
-
-
-# Fetch the 20-Newsgroups dataset, removing headers, footers, and quotes
-dataset = fetch_20newsgroups(subset="all", remove=('headers', 'footers', 'quotes'))
-texts = dataset.data  # List of document texts
-labels = dataset.target  # Integer labels (0–19)
-
-num_labels = len(dataset.target_names)  # Number of unique classes (20)
-
-
-# Split dataset into training and validation sets (80-20 split)
-train_texts, val_texts, train_labels, val_labels = train_test_split(
-    texts, labels, test_size=0.2, random_state=42
+from sklearn.metrics import (
+    accuracy_score, precision_recall_fscore_support,
+    f1_score, classification_report,
 )
 
-# Build graph representations for training data
-train_graphs = []
-for t, l in zip(train_texts, train_labels):
-    data = build_graph(t, l)
-    if data is not None:  # Exclude invalid graphs
-        train_graphs.append(data)
+import spacy
 
-# Build graph representations for validation data
-val_graphs = []
-for t, l in zip(val_texts, val_labels):
-    data = build_graph(t, l)
-    if data is not None:  # Exclude invalid graphs
-        val_graphs.append(data)
+SEED                = 42
+MAX_CONTENT_WORDS   = 80
+WORD_WINDOW         = 2      # 0 ⇒ disable word‑word edges
+BATCH_SIZE          = 4
+HIDDEN_DIM          = 64
+EPOCHS              = 50
+PATIENCE            = 5      # early‑stop patience
+LR                  = 1e-3
+WEIGHT_DECAY        = 5e-4
+EMBED_DIM           = 300    # spaCy "en_core_web_md" vectors
+EPSILON             = 1e-6
+DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
-# Create data loaders for batching
-train_loader = DataLoader(train_graphs, batch_size=4, shuffle=True)
-val_loader = DataLoader(val_graphs, batch_size=4)
 
-from torch_geometric.nn import global_add_pool
+def set_seed(seed: int = SEED) -> None:
+    random.seed(seed)
+    np.random.seed(seed)
+    torch.manual_seed(seed)
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed_all(seed)
+
+
+def dedup(seq: typing.Iterable[str]) -> list[str]:
+    """Deduplicate while preserving order."""
+    return list(dict.fromkeys(seq))
+
+
+try:
+    NLP = spacy.load("en_core_web_md")
+except OSError:
+    raise SystemExit(
+        "spaCy model 'en_core_web_md' is required.\n"
+        "Install via:  python -m spacy download en_core_web_md"
+    )
+
+
+def load_20ng():
+    tr = fetch_20newsgroups(
+        subset="train", remove=("headers", "footers", "quotes")
+    )
+    te = fetch_20newsgroups(
+        subset="test", remove=("headers", "footers", "quotes")
+    )
+    return tr.data, tr.target.tolist(), te.data, te.target.tolist(), tr.target_names
+
+# ---------------------------------------------------------------------------
+def build_graph(text: str, label: int) -> Data | None:
+    doc = NLP(text)
+
+    # Named entities ---------------------------------------------------------
+    ents = dedup([e.text for e in doc.ents])
+    ent_spans = {(e.start, e.end) for e in doc.ents}
+
+    # Content words ----------------------------------------------------------
+    words: list[str] = []
+    for tok in doc:
+        if not tok.is_alpha or tok.is_stop:
+            continue
+        if any(s <= tok.i < e for s, e in ent_spans):
+            continue
+        words.append(tok.text.lower())
+    words = dedup(words[:MAX_CONTENT_WORDS])
+
+    if not ents or not words:
+        return None
+
+    nodes = dedup(ents + words)               
+    is_entity = torch.tensor([n in ents for n in nodes], dtype=torch.bool)
+
+    x_fp16 = torch.stack(
+        [torch.tensor(NLP(tok).vector, dtype=torch.float16) for tok in nodes]
+    )
+
+    idx = {tok: i for i, tok in enumerate(nodes)}
+    edges: set[tuple[int, int]] = set()
+
+    for e in ents:
+        ei = idx[e]
+        for w in words:
+            wi = idx[w]
+            edges.add((ei, wi)); edges.add((wi, ei))
+
+    for sent in doc.sents:
+        s_ents = [e.text for e in sent.ents if e.text in idx]
+        for a, b in itertools.permutations(s_ents, 2):
+            edges.add((idx[a], idx[b]))
+
+    if WORD_WINDOW > 0:
+        for i in range(len(words) - WORD_WINDOW + 1):
+            win = words[i:i + WORD_WINDOW]
+            for u, v in itertools.permutations(win, 2):
+                edges.add((idx[u], idx[v]))
+
+    edge_index = torch.tensor(list(edges), dtype=torch.long).t().contiguous()
+    return Data(x=x_fp16, edge_index=edge_index,
+                y=torch.tensor([label]), is_entity=is_entity)
+
+
+def make_loaders(batch_size: int = BATCH_SIZE):
+    X_tr_raw, y_tr_raw, X_te_raw, y_te_raw, label_names = load_20ng()
+    X_tr, X_val, y_tr, y_val = train_test_split(
+        X_tr_raw, y_tr_raw, test_size=0.10,
+        stratify=y_tr_raw, random_state=SEED
+    )
+
+    def to_graphs(xs, ys):
+        return [
+            g for x, y in zip(xs, ys) if (g := build_graph(x, y)) is not None
+        ]
+
+    tr_ds, val_ds, te_ds = map(
+        lambda pair: to_graphs(*pair),
+        [(X_tr, y_tr), (X_val, y_val), (X_te_raw, y_te_raw)]
+    )
+
+    return (
+        DataLoader(tr_ds,  batch_size=batch_size, shuffle=True),
+        DataLoader(val_ds, batch_size=batch_size),
+        DataLoader(te_ds,  batch_size=batch_size),
+        label_names,
+    )
+
 
 class EWGCN(torch.nn.Module):
-    """
-    Entity-Word Graph Convolutional Network for text classification.
-    """
-    def __init__(self, in_dim, hidden=64, n_cls=20):
-        """
-        Initializes the EW-GCN model.
-
-        Args:
-            in_dim (int): Input dimension (embedding size).
-            hidden (int): Hidden layer size.
-            n_cls (int): Number of classes.
-        """
+    def __init__(self, hidden: int, n_cls: int):
         super().__init__()
-        self.c1 = GCNConv(in_dim, hidden)  # First GCN layer
-        self.c2 = GCNConv(hidden, hidden)  # Second GCN layer
-        self.lin = torch.nn.Linear(hidden, n_cls)  # Classification layer
+        self.g1  = GCNConv(EMBED_DIM, hidden)
+        self.g2  = GCNConv(hidden, hidden)
+        self.out = torch.nn.Linear(hidden, n_cls)
 
-    def forward(self, x, edge_index, batch, num_entity):
-        """
-        Forward pass of the EW-GCN model.
+    def forward(self, x_fp16: Tensor, ei: Tensor,
+                batch: Tensor, mask: Tensor) -> Tensor:
+        x = x_fp16.float()
+        x = self.g1(x, ei).relu()
+        x = self.g2(x, ei).relu()
 
-        Args:
-            x (Tensor): Node features.
-            edge_index (Tensor): Edge indices.
-            batch (Tensor): Batch vector.
-            num_entity (Tensor): Number of entities per graph.
+        # entity‑mean pooling
+        ent_sum = global_add_pool(x * mask.unsqueeze(-1).float(), batch)
+        ent_cnt = global_add_pool(mask.unsqueeze(-1).float(), batch)
+        doc_vec = ent_sum / (ent_cnt + EPSILON)
 
-        Returns:
-            Tensor: Log-probabilities for each class.
-        """
-        # Apply GCN layers with ReLU activation
-        x = self.c1(x.float(), edge_index).relu()
-        x = self.c2(x, edge_index).relu()
+        # fallback if graph has zero entities (rare)
+        zero = (ent_cnt.squeeze(-1) < EPSILON)
+        if zero.any():
+            doc_vec = torch.where(
+                zero.unsqueeze(-1),
+                global_mean_pool(x, batch),
+                doc_vec
+            )
 
-        # Create a mask to identify entity nodes
-        ent_mask = (torch.arange(x.size(0), device=x.device) < num_entity[batch]).float().unsqueeze(-1)
+        return torch.log_softmax(self.out(doc_vec), dim=1)
 
-        # Compute sum and count of entity features per graph
-        ent_sum = global_add_pool(x * ent_mask, batch)
-        ent_cnt = global_add_pool(ent_mask, batch)
 
-        # Compute mean of entity features with a fallback to all nodes
-        ent_mean = ent_sum / (ent_cnt + 1e-6)
-        all_mean = global_mean_pool(x, batch)
-        cond = (ent_cnt > 0).expand_as(ent_mean)
-        pooled = torch.where(cond, ent_mean, all_mean)
-
-        # Output class probabilities
-        return F.log_softmax(self.lin(pooled), dim=1)
-
-# Set device to GPU (MPS) if available, otherwise CPU
-device = torch.device("mps" if torch.backends.mps.is_available() else "cpu")
-model = EWGCN(vec_len, hidden=64, n_cls=num_labels).to(device)
-opt = torch.optim.Adam(model.parameters(), lr=1e-3, weight_decay=5e-4)
-
-def train_epoch():
-    """
-    Trains the model for one epoch.
-
-    Returns:
-        float: Average training loss.
-    """
-    model.train()
-    total_loss = 0
-    for batch in train_loader:
-        batch = batch.to(device)
-        opt.zero_grad()
-        out = model(batch.x.to(device), batch.edge_index.to(device),
-                    batch.batch.to(device), batch.num_entity.to(device))
-        loss = F.nll_loss(out, batch.y)
-        loss.backward()
-        opt.step()
-        total_loss += loss.item()
-    return total_loss / len(train_loader)
-
-def eval_loader(loader):
-    """
-    Evaluates the model on a data loader.
-
-    Args:
-        loader (DataLoader): Data loader to evaluate.
-
-    Returns:
-        float: Accuracy on the dataset.
-    """
+def evaluate(model: EWGCN, loader: DataLoader) -> dict[str, typing.Any]:
     model.eval()
-    correct = 0
-    with torch.no_grad():
-        for batch in loader:
-            batch = batch.to(device)
-            pred = model(batch.x, batch.edge_index, batch.batch,
-                         batch.num_entity.to(device)).argmax(dim=1)
-            correct += int((pred == batch.y).sum())
-    return correct / len(loader.dataset)
+    preds, gold = [], []
+    with torch.inference_mode():
+        for b in loader:
+            b = b.to(DEVICE)
+            out = model(b.x, b.edge_index, b.batch, b.is_entity)
+            preds.append(out.argmax(1).cpu())
+            gold.append(b.y.cpu())
+    y_pred = torch.cat(preds).numpy()
+    y_true = torch.cat(gold).numpy()
 
-# Train and evaluate the model for 50 epochs
-for epoch in range(1, 51):
-    loss = train_epoch()
-    val_acc = eval_loader(val_loader)
-    print(f"Epoch {epoch:02d}, Loss: {loss:.4f}, Val Acc: {val_acc:.4f}")
+    acc = accuracy_score(y_true, y_pred)
+    p, r, f1, _ = precision_recall_fscore_support(
+        y_true, y_pred, average="macro", zero_division=0
+    )
+    micro_f1 = f1_score(y_true, y_pred, average="micro")
+    return {
+        "accuracy": acc,
+        "macro_precision": p,
+        "macro_recall": r,
+        "macro_f1": f1,
+        "micro_f1": micro_f1,
+        "y_true": y_true,
+        "y_pred": y_pred,
+    }
+
+
+def per_class_report(
+    y_true: np.ndarray, y_pred: np.ndarray, label_names: list[str]
+) -> None:
+    report = classification_report(
+        y_true, y_pred, target_names=label_names,
+        output_dict=True, zero_division=0
+    )
+    with open("results_per_class.csv", "w", newline="") as f:
+        w = csv.writer(f)
+        w.writerow(["class", "precision", "recall", "f1", "support"])
+        for cls in label_names:
+            r = report[cls]
+            w.writerow([
+                cls,
+                f"{r['precision']:.4f}",
+                f"{r['recall']:.4f}",
+                f"{r['f1-score']:.4f}",
+                int(r['support']),
+            ])
+
+
+def train(model: EWGCN, tr_loader: DataLoader, val_loader: DataLoader):
+    opt = torch.optim.Adam(model.parameters(), lr=LR, weight_decay=WEIGHT_DECAY)
+    best_state, best_acc, impatience = None, 0.0, 0
+
+    for epoch in range(1, EPOCHS + 1):
+        model.train()
+        for b in tr_loader:
+            b = b.to(DEVICE)
+            opt.zero_grad()
+            loss = F.nll_loss(
+                model(b.x, b.edge_index, b.batch, b.is_entity), b.y
+            )
+            loss.backward()
+            opt.step()
+
+        val_acc = evaluate(model, val_loader)["accuracy"]
+        print(
+            f"Epoch {epoch:02d}  val‑acc {val_acc*100:5.2f}%"
+        )
+
+        if val_acc > best_acc + 1e-4:
+            best_acc = val_acc
+            best_state = model.state_dict()
+            impatience = 0
+        else:
+            impatience += 1
+        if impatience >= PATIENCE:
+            print("Early stopping.")
+            break
+
+    if best_state is not None:
+        model.load_state_dict(best_state)
+
+
+def main() -> None:
+    t0 = time.time()
+    set_seed()
+
+    print("Loading data & constructing graphs …")
+    tr_loader, val_loader, te_loader, labels = make_loaders()
+    print(f"Graphs — train: {len(tr_loader.dataset)}, "
+          f"val: {len(val_loader.dataset)}, "
+          f"test: {len(te_loader.dataset)}")
+
+    model = EWGCN(HIDDEN_DIM, n_cls=20).to(DEVICE)
+    print(f"Total parameters: {sum(p.numel() for p in model.parameters()):,}")
+
+    print("\nTraining …")
+    train(model, tr_loader, val_loader)
+
+    print("\nEvaluating …")
+    val_metrics  = evaluate(model, val_loader)
+    test_metrics = evaluate(model, te_loader)
+
+    per_class_report(
+        test_metrics["y_true"], test_metrics["y_pred"], labels
+    )
+
+    def pretty(d: dict[str, float]) -> str:
+        keys = [
+            "accuracy", "macro_precision",
+            "macro_recall", "macro_f1", "micro_f1",
+        ]
+        return " | ".join(
+            f"{k}: {d[k]*100:6.2f}%" for k in keys
+        )
+
+    print("\n=== VALIDATION (10 % hold‑out) ===")
+    print(pretty(val_metrics))
+
+    print("\n=== TEST (official split) ===")
+    print(pretty(test_metrics))
+    print("Per‑class F1 saved to results_per_class.csv")
+
+    elapsed = time.time() - t0
+    print(f"\nTotal runtime: {elapsed/60:.1f} min on {DEVICE}")
+
+
+if __name__ == "__main__":
+    main()
