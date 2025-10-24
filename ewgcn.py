@@ -65,14 +65,12 @@ def load_20ng():
     return tr.data, tr.target.tolist(), te.data, te.target.tolist(), tr.target_names
 
 # ---------------------------------------------------------------------------
-def build_graph(text: str, label: int) -> Data | None:
+def build_graph(text: str, label: int) -> Data:
     doc = NLP(text)
 
-    # Named entities ---------------------------------------------------------
     ents = dedup([e.text for e in doc.ents])
     ent_spans = {(e.start, e.end) for e in doc.ents}
 
-    # Content words ----------------------------------------------------------
     words: list[str] = []
     for tok in doc:
         if not tok.is_alpha or tok.is_stop:
@@ -82,39 +80,59 @@ def build_graph(text: str, label: int) -> Data | None:
         words.append(tok.text.lower())
     words = dedup(words[:MAX_CONTENT_WORDS])
 
-    if not ents or not words:
-        return None
+    used_stopword_fallback = False
+    if not words:
+        words = dedup([tok.text.lower() for tok in doc if tok.is_alpha])[:MAX_CONTENT_WORDS]
+        used_stopword_fallback = True
 
-    nodes = dedup(ents + words)               
-    is_entity = torch.tensor([n in ents for n in nodes], dtype=torch.bool)
+    nodes = dedup(ents + words)
+
+    if not nodes:
+        nodes = ["<empty>"]  # extremely rare
 
     x_fp16 = torch.stack(
         [torch.tensor(NLP(tok).vector, dtype=torch.float16) for tok in nodes]
     )
+    is_entity = torch.tensor([n in ents for n in nodes], dtype=torch.bool)
 
     idx = {tok: i for i, tok in enumerate(nodes)}
     edges: set[tuple[int, int]] = set()
 
-    for e in ents:
-        ei = idx[e]
-        for w in words:
-            wi = idx[w]
-            edges.add((ei, wi)); edges.add((wi, ei))
+    if ents and words:
+        for e in ents:
+            ei = idx[e]
+            for w in words:
+                wi = idx[w]
+                edges.add((ei, wi)); edges.add((wi, ei))
 
     for sent in doc.sents:
         s_ents = [e.text for e in sent.ents if e.text in idx]
         for a, b in itertools.permutations(s_ents, 2):
             edges.add((idx[a], idx[b]))
 
-    if WORD_WINDOW > 0:
+    if WORD_WINDOW > 0 and words:
         for i in range(len(words) - WORD_WINDOW + 1):
             win = words[i:i + WORD_WINDOW]
             for u, v in itertools.permutations(win, 2):
                 edges.add((idx[u], idx[v]))
 
+    if not edges:
+        i0 = 0
+        edges.add((i0, i0))
+
     edge_index = torch.tensor(list(edges), dtype=torch.long).t().contiguous()
-    return Data(x=x_fp16, edge_index=edge_index,
-                y=torch.tensor([label]), is_entity=is_entity)
+
+    has_entities = torch.tensor([bool(ents)], dtype=torch.bool)
+    used_sw_fb = torch.tensor([used_stopword_fallback], dtype=torch.bool)
+
+    return Data(
+        x=x_fp16,
+        edge_index=edge_index,
+        y=torch.tensor([label]),
+        is_entity=is_entity,
+        has_entities=has_entities,
+        used_stopword_fallback=used_sw_fb,
+    )
 
 
 def make_loaders(batch_size: int = BATCH_SIZE):
