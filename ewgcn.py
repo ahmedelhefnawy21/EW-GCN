@@ -1,6 +1,7 @@
 from __future__ import annotations
 import csv, itertools, random, time, typing
 from pathlib import Path
+import argparse
 
 import numpy as np
 import torch
@@ -31,6 +32,35 @@ WEIGHT_DECAY        = 5e-4
 EMBED_DIM           = 300    # spaCy "en_core_web_md" vectors
 EPSILON             = 1e-6
 DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+
+
+def parse_args():
+    p = argparse.ArgumentParser()
+    p.add_argument("--runs", type=int, default=1, help="number of random seeds")
+    p.add_argument("--seed", type=int, default=SEED)
+    p.add_argument("--word-cap", type=int, default=MAX_CONTENT_WORDS)
+    p.add_argument("--hidden", type=int, default=HIDDEN_DIM)
+    p.add_argument("--epochs", type=int, default=EPOCHS)
+    p.add_argument("--pool", choices=["entity", "all"], default="entity",
+                   help="entity-focused pooling or all-node mean")
+    p.add_argument("--use-ew", action="store_true", help="use entity–word edges")
+    p.add_argument("--use-ee", action="store_true", help="use entity–entity edges")
+    p.add_argument("--window", type=int, default=WORD_WINDOW,
+                   help="word–word window size; 0 disables")
+    return p.parse_args()
+
+
+def coverage_report(graphs, name: str) -> None:
+    n = len(graphs)
+    n_with_ent = sum(int(g.has_entities.item()) for g in graphs)
+    n_sw_fb    = sum(int(g.used_stopword_fallback.item()) for g in graphs)
+    avg_nodes  = sum(g.num_nodes for g in graphs) / max(n, 1)
+    print(
+        f"[coverage] {name:5s} | docs={n:5d} | "
+        f"with_entities={n_with_ent:5d} ({n_with_ent/n:5.1%}) | "
+        f"stopword_fallback={n_sw_fb:5d} ({n_sw_fb/n:5.1%}) | "
+        f"avg_nodes={avg_nodes:4.1f}"
+    )
 
 
 def set_seed(seed: int = SEED) -> None:
@@ -143,14 +173,19 @@ def make_loaders(batch_size: int = BATCH_SIZE):
     )
 
     def to_graphs(xs, ys):
-        return [
-            g for x, y in zip(xs, ys) if (g := build_graph(x, y)) is not None
-        ]
+        graphs = []
+        for x, y in zip(xs, ys):
+            g = build_graph(x, y)   
+            graphs.append(g)
+        return graphs
 
-    tr_ds, val_ds, te_ds = map(
-        lambda pair: to_graphs(*pair),
-        [(X_tr, y_tr), (X_val, y_val), (X_te_raw, y_te_raw)]
-    )
+    tr_ds  = to_graphs(X_tr,  y_tr)
+    val_ds = to_graphs(X_val, y_val)
+    te_ds  = to_graphs(X_te_raw, y_te_raw)
+
+    coverage_report(tr_ds,  "train")
+    coverage_report(val_ds, "val")
+    coverage_report(te_ds,  "test")
 
     return (
         DataLoader(tr_ds,  batch_size=batch_size, shuffle=True),
@@ -158,6 +193,7 @@ def make_loaders(batch_size: int = BATCH_SIZE):
         DataLoader(te_ds,  batch_size=batch_size),
         label_names,
     )
+
 
 
 class EWGCN(torch.nn.Module):
